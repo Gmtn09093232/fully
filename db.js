@@ -1,19 +1,30 @@
 const mysql = require("mysql2");
 
-const db = mysql.createConnection({
-  host: "mysql-b39fece-gizie1873.b.aivencloud.com",
-  port: 13926,
-  user: "avnadmin",
-  password: "AVNS_JUIBkMXXEiKVHHy13Bu",
-  database: "defaultdb",
-  ssl: {
-    rejectUnauthorized: false
-  }
+// Create connection pool (better than single connection)
+const db = mysql.createPool({
+    host: process.env.DB_HOST || "host",
+    port: process.env.DB_PORT || 3306,
+    user: process.env.DB_USER || "root",
+    password: process.env.DB_PASSWORD || "",
+    database: process.env.DB_NAME || "bingo_db",
+
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0,
+
+    connectTimeout: 10000 // avoid long hanging
 });
 
-db.connect(err => {
-  if (err) console.error("Connection failed:", err);
-  else console.log("Connected to Aiven MySQL");
+// Test connection
+db.getConnection((err, connection) => {
+    if (err) {
+        console.error("❌ Database connection failed:");
+        console.error(err);
+    } else {
+        console.log("✅ MySQL Connected Successfully");
+        connection.release();
+    }
 });
 
 module.exports = db;
+
