@@ -5,92 +5,134 @@ const socketIo = require('socket.io');
 const path = require('path');
 const session = require('express-session');
 const bcrypt = require('bcrypt');
-const fs = require('fs-extra');
 const { v4: uuidv4 } = require('uuid');
+const mysql = require('mysql2/promise');
 
 const app = express();
 const server = http.createServer(app);
 const io = socketIo(server);
-const db = require("./db");
 
-
-// Create user
-app.post("/register", (req, res) => {
-  const { username, balance } = req.body;
-
-  db.query(
-    "INSERT INTO users (username, balance) VALUES (?, ?)",
-    [username, balance],
-    (err, result) => {
-      if (err) return res.status(500).send(err);
-      res.send("User created");
-    }
-  );
+// ========== MySQL Connection Pool (Aiven) ==========
+// ========== MySQL Connection Pool (Aiven with SSL) ==========
+const pool = mysql.createPool({
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    port: parseInt(process.env.DB_PORT),
+    ssl: {
+        // For Aiven "REQUIRED" mode, rejectUnauthorized: false works.
+        // For production, download the CA certificate and use it.
+        rejectUnauthorized: false
+    },
+    connectTimeout: 10000,
+    waitForConnections: true,
+    connectionLimit: 10
 });
 
-// Middleware
+// Create users table if it doesn't exist
+async function initDatabase() {
+    try {
+        const connection = await pool.getConnection();
+        console.log('✅ MySQL connected successfully');
+        connection.release();
+
+        const createTableSQL = `
+            CREATE TABLE IF NOT EXISTS users (
+                userId VARCHAR(36) PRIMARY KEY,
+                username VARCHAR(50) UNIQUE NOT NULL,
+                password VARCHAR(255) NOT NULL,
+                balance DECIMAL(10,2) NOT NULL DEFAULT 100.00,
+                createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `;
+        await pool.execute(createTableSQL);
+        console.log('✅ Users table ready');
+    } catch (err) {
+        console.error('❌ Database init error:', err.message);
+        console.error('Full error:', err);
+        process.exit(1);
+    }
+}
+initDatabase();
+
+// ========== Middleware ==========
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(session({
-    secret: 'bingo_super_secret_key_change_me',
+    secret: process.env.SESSION_SECRET || 'bingo_super_secret_key_change_me',
     resave: false,
     saveUninitialized: false,
     cookie: { secure: false, maxAge: 1000 * 60 * 60 * 24 }
 }));
 
-// Serve the frontend
+// Serve frontend
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-
-
-// User data storage
-const USERS_FILE = './users.json';
-fs.ensureFileSync(USERS_FILE);
-let users = {};
-try {
-    users = fs.readJsonSync(USERS_FILE);
-} catch (e) { users = {}; }
-
-function saveUsers() {
-    fs.writeJsonSync(USERS_FILE, users, { spaces: 2 });
-}
-
-function getLoggedInUser(req) {
+// Helper to get logged-in user from session (returns row from DB)
+async function getLoggedInUser(req) {
     if (!req.session.userId) return null;
-    return Object.values(users).find(u => u.userId === req.session.userId);
+    const [rows] = await pool.execute(
+        'SELECT userId, username, balance FROM users WHERE userId = ?',
+        [req.session.userId]
+    );
+    return rows[0] || null;
 }
 
-// ---------- AUTH ENDPOINTS ----------
+// ========== Auth & Balance Endpoints ==========
 app.post('/api/register', async (req, res) => {
     const { username, password } = req.body;
-    if (!username || !password) return res.status(400).json({ error: 'Missing fields' });
-    if (users[username]) return res.status(400).json({ error: 'Username already exists' });
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const userId = uuidv4();
-    users[username] = {
-        userId,
-        username,
-        password: hashedPassword,
-        balance: 100,
-        createdAt: new Date().toISOString()
-    };
-    saveUsers();
-    req.session.userId = userId;
-    req.session.username = username;
-    res.json({ success: true, username, balance: users[username].balance });
+    if (!username || !password) {
+        return res.status(400).json({ error: 'Missing fields' });
+    }
+    try {
+        // Check if username already exists
+        const [existing] = await pool.execute(
+            'SELECT username FROM users WHERE username = ?',
+            [username]
+        );
+        if (existing.length > 0) {
+            return res.status(400).json({ error: 'Username already exists' });
+        }
+        const userId = uuidv4();
+        const hashedPassword = await bcrypt.hash(password, 10);
+        await pool.execute(
+            'INSERT INTO users (userId, username, password, balance) VALUES (?, ?, ?, ?)',
+            [userId, username, hashedPassword, 100]
+        );
+        req.session.userId = userId;
+        req.session.username = username;
+        res.json({ success: true, username, balance: 100 });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Server error' });
+    }
 });
 
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
-    const user = users[username];
-    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
-    const match = await bcrypt.compare(password, user.password);
-    if (!match) return res.status(401).json({ error: 'Invalid credentials' });
-    req.session.userId = user.userId;
-    req.session.username = username;
-    res.json({ success: true, username, balance: user.balance });
+    try {
+        const [rows] = await pool.execute(
+            'SELECT userId, username, password, balance FROM users WHERE username = ?',
+            [username]
+        );
+        if (rows.length === 0) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        const user = rows[0];
+        const match = await bcrypt.compare(password, user.password);
+        if (!match) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        req.session.userId = user.userId;
+        req.session.username = user.username;
+        res.json({ success: true, username: user.username, balance: user.balance });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Server error' });
+    }
 });
 
 app.post('/api/logout', (req, res) => {
@@ -98,37 +140,49 @@ app.post('/api/logout', (req, res) => {
     res.json({ success: true });
 });
 
-app.get('/api/me', (req, res) => {
-    const user = getLoggedInUser(req);
+app.get('/api/me', async (req, res) => {
+    const user = await getLoggedInUser(req);
     if (!user) return res.status(401).json({ error: 'Not logged in' });
     res.json({ username: user.username, balance: user.balance });
 });
 
 app.post('/api/deposit', async (req, res) => {
-    const user = getLoggedInUser(req);
+    const user = await getLoggedInUser(req);
     if (!user) return res.status(401).json({ error: 'Not logged in' });
     const { amount } = req.body;
     const numAmount = parseFloat(amount);
-    if (isNaN(numAmount) || numAmount <= 0) return res.status(400).json({ error: 'Invalid amount' });
-    // Simulate deposit – replace with real Telebirr/Chapa integration
-    user.balance += numAmount;
-    saveUsers();
-    res.json({ success: true, newBalance: user.balance });
+    if (isNaN(numAmount) || numAmount <= 0) {
+        return res.status(400).json({ error: 'Invalid amount' });
+    }
+    // Simulate deposit – replace with Telebirr/Chapa integration
+    const newBalance = user.balance + numAmount;
+    await pool.execute(
+        'UPDATE users SET balance = ? WHERE userId = ?',
+        [newBalance, user.userId]
+    );
+    res.json({ success: true, newBalance });
 });
 
 app.post('/api/withdraw', async (req, res) => {
-    const user = getLoggedInUser(req);
+    const user = await getLoggedInUser(req);
     if (!user) return res.status(401).json({ error: 'Not logged in' });
     const { amount } = req.body;
     const numAmount = parseFloat(amount);
-    if (isNaN(numAmount) || numAmount <= 0) return res.status(400).json({ error: 'Invalid amount' });
-    if (user.balance < numAmount) return res.status(400).json({ error: 'Insufficient balance' });
-    user.balance -= numAmount;
-    saveUsers();
-    res.json({ success: true, newBalance: user.balance });
+    if (isNaN(numAmount) || numAmount <= 0) {
+        return res.status(400).json({ error: 'Invalid amount' });
+    }
+    if (user.balance < numAmount) {
+        return res.status(400).json({ error: 'Insufficient balance' });
+    }
+    const newBalance = user.balance - numAmount;
+    await pool.execute(
+        'UPDATE users SET balance = ? WHERE userId = ?',
+        [newBalance, user.userId]
+    );
+    res.json({ success: true, newBalance });
 });
 
-// ---------- GAME STATE ----------
+// ========== Game State (in-memory) ==========
 let players = {};           // socketId -> player object
 let takenCards = new Set();
 let gameActive = false;
@@ -138,12 +192,13 @@ let countdownTimeout = null;
 let countdownSeconds = 30;
 let isLobbyOpen = true;
 const GAME_COST = 10;
-const HOUSE_PERCENT = 0.2; // 20% for you
+const HOUSE_PERCENT = 0.2;
 
 function calculatePrize() {
     const playerCount = Object.keys(players).length;
     return GAME_COST * playerCount * (1 - HOUSE_PERCENT);
 }
+
 function generateCardFromNumber(cardNum) {
     function seededRandom(seed) {
         let x = Math.sin(seed) * 10000;
@@ -209,22 +264,36 @@ function startCountdown() {
     }, 1000);
 }
 
-function startGame() {
+async function startGame() {
     if (gameActive) return;
-    // Deduct cost from all players
+
+    // Deduct GAME_COST from each player's balance in DB
     const playersToRemove = [];
     for (let id in players) {
         const p = players[id];
-        const user = users[p.username];
-        if (!user || user.balance < GAME_COST) {
+        try {
+            const [rows] = await pool.execute(
+                'SELECT balance FROM users WHERE username = ?',
+                [p.username]
+            );
+            if (rows.length === 0 || rows[0].balance < GAME_COST) {
+                playersToRemove.push(id);
+                io.to(id).emit('error', `Insufficient balance (need ${GAME_COST} credits). Please deposit.`);
+            } else {
+                const newBalance = rows[0].balance - GAME_COST;
+                await pool.execute(
+                    'UPDATE users SET balance = ? WHERE username = ?',
+                    [newBalance, p.username]
+                );
+                io.to(id).emit('balanceUpdate', newBalance);
+            }
+        } catch (err) {
+            console.error(err);
             playersToRemove.push(id);
-            io.to(id).emit('error', `Insufficient balance (need ${GAME_COST} credits). Please deposit.`);
-        } else {
-            user.balance -= GAME_COST;
-            saveUsers();
-            io.to(id).emit('balanceUpdate', user.balance);
+            io.to(id).emit('error', 'Database error, cannot start game');
         }
     }
+
     playersToRemove.forEach(id => {
         const cardNum = players[id].cardNumber;
         takenCards.delete(cardNum);
@@ -295,56 +364,77 @@ function checkWin(marked) {
     return corners.every(idx => marked[idx]);
 }
 
-function handleMark(socketId, cellIndex, numberValue) {
+async function handleMark(socketId, cellIndex, numberValue) {
     const player = players[socketId];
     if (!player || !gameActive) return false;
     if (!calledNumbers.includes(numberValue)) return false;
     if (player.card[cellIndex] !== numberValue) return false;
     if (player.marked[cellIndex]) return false;
+
     player.marked[cellIndex] = true;
     io.to(socketId).emit('markConfirmed', { cellIndex, number: numberValue });
+
     if (checkWin(player.marked)) {
         gameActive = false;
         if (autoInterval) clearInterval(autoInterval);
         autoInterval = null;
-        // Award prize
+
         const prize = calculatePrize();
 
-        winnerUser.balance += prize;
-        saveUsers();
+        // Award prize to winner from DB
+        try {
+            const [rows] = await pool.execute(
+                'SELECT balance FROM users WHERE username = ?',
+                [player.username]
+            );
+            if (rows.length > 0) {
+                const newBalance = rows[0].balance + prize;
+                await pool.execute(
+                    'UPDATE users SET balance = ? WHERE username = ?',
+                    [newBalance, player.username]
+                );
+                io.to(socketId).emit('balanceUpdate', newBalance);
+            }
+        } catch (err) {
+            console.error('Failed to award prize:', err);
+        }
 
-        io.to(socketId).emit('balanceUpdate', winnerUser.balance);
+        io.emit('gameWinner', {
+            winnerId: socketId,
+            winnerName: player.name,
+            prize: prize,
+            players: Object.keys(players).length
+        });
+        io.emit('prizeUpdate', {
+            prize: prize,
+            players: Object.keys(players).length
+        });
 
-
-io.emit('gameWinner', {
-    winnerId: socketId,
-    winnerName: player.name,
-    prize: prize,
-    players: Object.keys(players).length
-});
-     io.emit('prizeUpdate', {
-    prize: calculatePrize(),
-    players: Object.keys(players).length
-}); 
         setTimeout(() => fullReset(), 5000);
         return true;
     }
     return false;
 }
 
-// ---------- SOCKET.IO ----------
+// ========== Socket.IO ==========
 io.on('connection', (socket) => {
     console.log('Client connected', socket.id);
 
-    socket.on('auth', ({ userId, username }) => {
+    socket.on('auth', async ({ userId, username }) => {
         socket.userId = userId;
         socket.username = username;
         const available = [];
         for (let i = 1; i <= 100; i++) if (!takenCards.has(i)) available.push(i);
         socket.emit('availableCards', available);
         socket.emit('lobbyState', { isLobbyOpen, countdown: countdownSeconds, gameActive });
-        const user = users[username];
-        if (user) socket.emit('balanceUpdate', user.balance);
+
+        // Send current balance
+        try {
+            const [rows] = await pool.execute('SELECT balance FROM users WHERE username = ?', [username]);
+            if (rows.length) socket.emit('balanceUpdate', rows[0].balance);
+        } catch (err) {
+            console.error(err);
+        }
     });
 
     socket.on('selectCard', ({ name, cardNumber }) => {
@@ -405,5 +495,5 @@ io.on('connection', (socket) => {
     });
 });
 
-const PORT = process.env.PORT || 13930;
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`✅ Bingo server running on http://localhost:${PORT}`));
